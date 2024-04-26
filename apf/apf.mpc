@@ -1,0 +1,251 @@
+import mpc_math
+from math import e
+from math import pi
+
+global M_PI
+M_PI = pi
+
+
+# gains
+ka = 1.0
+kr = 1.0
+k_acc = Array(3, cfix)  #  acc shaping factor?
+k_acc[0] = 1
+k_acc[1] = 1
+k_acc[2] = 1      
+
+#  diagonal shaping matrices
+#make Qa matrix
+Qa = Matrix(3, 3, sfix) #double Qa[3][3] = {0.025,0,0, 0,0.025,0, 0,0,0.075};
+Qa.assign_all(0)
+Qa[0][0] = 0.025
+Qa[1][1] = 0.025
+Qa[2][2] = 0.075
+
+#make Qb matrix
+Qb = Matrix(3, 3, sfix) #double Qb[3][3] = {0.0125,0,0, 0,0.0125,0, 0,0,0.075};
+Qb.assign_all(0)
+Qb[0][0] = 0.0125
+Qb[1][1] = 0.0125
+Qb[2][2] = 0.075
+
+#make N matrix
+N = Matrix(3, 3, sfix) #double N[3][3] = {0.0025,0,0, 0,0.0025,0, 0,0,0.0025};
+N.assign_all(0)
+N[0][0] = 0.0025
+N[1][1] = 0.0025
+N[2][2] = 0.0025
+
+#make pd matrix
+pd = Matrix(3, 3, sfix) #double pd[3][3] = {15,0,0, 0,15,0, 0,0,0};  
+pd.assign_all(0)
+pd[0][0] = 15
+pd[1][1] = 15
+pd[2][2] = 0
+
+rMaxConst = 100
+R = 100              #  r avoid threshold, (10km)^2
+
+#  input guidance param
+#make bmatinv matrix ||  3x3 diagonal matrix (1/mass, 1/mass, 1/moment of inertia)  
+bmatinv = Matrix(3, 3, sfix) #double bmatinv[3][3] = {100,0,0,0,100,0,0,0,100};
+bmatinv.assign_all(0)
+bmatinv[0][0] = 100
+bmatinv[1][1] = 100
+bmatinv[2][2] = 100
+
+
+rAvoid = 5              #  km; abs distance between chaser/obstacle: sq(x^2 + y^2)
+constVio = 0              #  default to zero; true if constraints are violated
+#  quads semi-major/minor axes
+targetConstParams = Array(5, cfix)
+targetConstParams[0] = 1
+targetConstParams[1] = 1 
+targetConstParams[2] = 1
+targetConstParams[3] = 1
+targetConstParams[4] = 1
+
+dockThresh = Array(3, cfix)
+dockThresh[0] = 0.05*0.05
+dockThresh[1] = 0.1*0.1
+dockThresh[2] = 10*180/M_PI
+
+
+
+#  compute distance from chaser to target
+def r_ct(T, C):
+    ct = T - C           #  distance from chaser to target
+    return ct
+
+#  compute distance from chaser to target 
+def th(x, y):
+    theta = 0.0
+    if x != 0:
+        theta = mpc_math.atan(sfix(y/x))
+    if x == 0:
+        theta = 0.0
+
+    return theta
+
+
+#  compute distance squared from chaser to target/object
+def distSq(rXt):
+    distsq = rXt[0]*rXt[0] + rXt[1]*rXt[1]
+    distsq
+
+
+#  compute miss distance 
+def miss_dist(rXt):
+    md = (rXt[0]*rXt[0] + rXt[1]*rXt[1])
+    return md
+
+
+#  compute h from chaser to target/obstacle */
+def h(rXt):
+    h = sqrt(rXt[0]*rXt[0] + rXt[1]*rXt[1])
+    return h
+
+
+#  compute obstacle boundary, assuming circular */
+def bound(xObs):
+    #  coordinates of circle surrounding obstacle x,y with radius R: x+r, y+r, x-r, y-r
+    bd = Array(3, cfix)
+    bd[0] = xObs[0]+R
+    bd[1] = xObs[1]+R
+    bd[2] = xObs[0]-R
+    bd[3] = xObs[1]-R
+    return bd
+
+
+def fmod(x, y):
+    x = sfix(x)
+    y = sfix(y)
+    quotient = x / y
+    integer_part = sint(quotient)
+    remainder = x - integer_part * y
+    return remainder
+
+#  compute attractive potential gradient between chaser and target */
+def a_grad(rCt):
+    dPhi_a = Array(3, sfix)                        #  gradient due to attractive potential
+    rCt[2] = fmod((rCt[2]+M_PI),2*M_PI) - M_PI     #  wrap relative angle between 0 and +/- pi
+    for i in range(3):
+        dPhi_a[i] = ka*Qa[i][i]*rCt[i]; 
+        # printf("ka = %f\n Qa = %f\n rDt[%d]= %f\n attr value %d = %f\n",ka,Qa[i][i],i,rDt[i],i,dPhi_a[i]);
+    
+    return dPhi_a;
+
+#  compute repulsive potential gradient between chaser and object */
+def r_grad(rCt, rCo, rTo):
+    dPhi_r = Array(3, sfix)                        #  gradient due to repulsive potential
+    constVio = 0
+    rCt[2] = fmod((rCt[2]+M_PI),2*M_PI) - M_PI     #  wrap relative angle between 0 and +/- pi
+    rCo[2] = fmod((rCo[2]+M_PI),2*M_PI) - M_PI   
+    rTo[2] = fmod((rTo[2]+M_PI),2*M_PI) - M_PI   
+    r_cons = 10 
+    for i in range(3):
+        dPhi_r[i] = r_cons* mpc_math.pow_fx(e,-(rCo[i]*N[i][i]*rCo[i])/r_cons)
+        #  printf("rep value %d: %f\n", i, dPhi_r[i]);
+    
+    #  for(int i = 0; i < 2; i++){
+    #      dPhi_r[i] = dPhi_r[i] - 2*(M_PI*R*R)*exp(-(rDo[i]*rDo[i])/R)*rDo[i];
+    #      printf("rep value %d: %f\n", i, dPhi_r[i]);
+    #  }
+    # dPhi_r[2] = dPhi_r[2] - R*exp(-(rDo[2]*rDo[2])/R)*rDo[2];
+    #  #  determine if constraints were violated, eg. deputy passes into obstacle avoidance radius
+    if ((rCo[0]*rCo[0] + rCo[1]*rCo[1]).reveal() < cfix(r_cons*r_cons)):
+        constVio = 1
+    return dPhi_r, constVio
+
+
+def ret(attr,rep, xDep): 
+    #  Compute control input*/
+    vDesired = Array(3, sfix)                 #  Desired velocity [m/s]
+    aDesired = Array(3, sfix)                 #  Desired acceleration [m/s/s]
+    u = Array(3, sfix)                        #  control input force [N]
+    for i in range(3):
+        vDesired[i] = -(attr[i] + rep[i])               
+        aDesired[i] = (-k_acc[i]) * (xDep[i] - vDesired[i])
+        u[i] = bmatinv[i][i] * aDesired[i] 
+        # printf("u value %d: %f\n", i, u[i]);                        
+    
+    Fx = u[0];
+    Fy = u[1];
+    Tau = u[2];
+    return u;
+
+
+
+
+
+
+
+# Create position values */
+     
+x = Array(4, cfix)       #position: x, y, vx, vy(km, km, km/s, km,s)
+x.assign_all(0)
+x[0] = 0
+x[1] = 0
+x[2] = 0
+x[3] = 0
+t = 150                  #time (s)
+dt = 0.1                 #time interval (s)
+mass = 10                #mass in kg
+
+c_pos = Array(6, cfix)   #{x, y, T, vx, vy, vT}
+c_pos[0] = x[0] 
+c_pos[1] = x[1]
+c_pos[2] = 0 
+c_pos[3] = x[2]
+c_pos[4] = x[3]
+c_pos[5] = 0 
+
+t_pos = Array(3, sfix)
+t_pos[0] = 300
+t_pos[1] = 50
+t_pos[2] = th(50,300) 
+
+o_pos = Array(3, sfix)
+o_pos[0] = 200
+o_pos[1] = 20
+o_pos[2] = th(20,200)    
+
+# create distance arrays 
+rCt = Array(3, sfix)      #radius bw chaser and target
+rCo = Array(3, sfix)      #radius bw chaser and object
+rTo = Array(3, sfix)      #radius bw target and object
+
+for i in range(3):
+    rCt[i] = r_ct(t_pos[i], c_pos[i])      #chaser-target distance (x, y, theta)
+    rCo[i] = r_ct(o_pos[i], c_pos[i])      #chaser-object distance (x, y, theta)
+    rTo[i] = r_ct(t_pos[i], o_pos[i])      #target-object distance (x, y, theta)
+
+
+## Get potential gradients 
+attr = a_grad(rCt)
+rep, constVio = r_grad(rCt, rCo, rTo)
+
+## get return values 
+vals = ret(attr, rep, c_pos)
+Fx = vals[0]
+Fy = vals[1]
+Tau = vals[2]
+
+## initialize 1st and 2nd derivatives of x 
+xdot = Array(4, sfix)        #velocity & acceleration values
+xdot[0] = x[2]               #vx
+xdot[1] = x[3]               #vy
+xdot[2] = Fx/mass            #ax
+xdot[3] = Fy/mass            #ay
+
+# Create boolean values                               
+md = miss_dist(o_pos)
+
+## return values
+print_ln("Chaser position is %s, %s, %s", c_pos[0].reveal(), c_pos[1].reveal(), c_pos[2].reveal());
+print_ln("Target position (PRIVATE) is %s, %s, %s", t_pos[0].reveal(), t_pos[1].reveal(), t_pos[2].reveal());
+print_ln("Obstacle position (PRIVATE) is %s, %s, %s", o_pos[0].reveal(), o_pos[1].reveal(), o_pos[2].reveal());
+
+print_ln("Miss distance (PRIVATE) is %s", md.reveal());
+print_ln("Collision occurance (PRIVATE): %s", constVio);
+print_ln("F output values: %s, %s, %s", Fx.reveal(), Fy.reveal(), Tau.reveal());
